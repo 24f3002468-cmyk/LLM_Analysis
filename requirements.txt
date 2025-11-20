@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+requests
+playwright
+pydantic
+openai
+pandas
+numpy
+beautifulsoup4
+lxml
+pypdf
+openpyxl
