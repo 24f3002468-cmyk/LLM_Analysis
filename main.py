@@ -1,3 +1,4 @@
+# main.py
 import os
 import json
 import time
@@ -5,6 +6,8 @@ import requests
 import uvicorn
 import traceback
 import re
+import io
+import base64
 from urllib.parse import urljoin, urlparse
 
 from fastapi import FastAPI, HTTPException
@@ -12,9 +15,14 @@ from pydantic import BaseModel
 from playwright.async_api import async_playwright, Page
 from openai import OpenAI
 
+# Optional libs used by heuristics
+from bs4 import BeautifulSoup
+import pandas as pd
+from pypdf import PdfReader
+
 # ---------- CONFIG ----------
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN") or os.environ.get("OPENAI_API_KEY")
-MY_SECRET = os.environ.get("MY_SECRET")  # do NOT hardcode production secret in repo
+MY_SECRET = os.environ.get("MY_SECRET")  # must be set in env on Render
 
 if not MY_SECRET:
     print("⚠️ WARNING: MY_SECRET not set. Use a dev secret for testing.")
@@ -41,7 +49,6 @@ def safe_post_json(url: str, payload: dict, timeout=10, retries=3):
         try:
             r = requests.post(url, json=payload, timeout=timeout)
             r.raise_for_status()
-            # try parse json
             try:
                 return r.json()
             except ValueError:
@@ -53,19 +60,15 @@ def safe_post_json(url: str, payload: dict, timeout=10, retries=3):
 
 def find_submission_url_from_page(html: str, links: list, base_url: str):
     """Deterministic heuristics to find a submission URL."""
-    # 1) explicit links containing keywords
     for l in links:
         if l and any(k in l.lower() for k in ("submit", "answer", "response", "post")):
             return urljoin(base_url, l)
-    # 2) form action
     m = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', html, flags=re.I)
     if m:
         return urljoin(base_url, m.group(1))
-    # 3) script-embedded url patterns
     m2 = re.search(r'https?://[^\s\'"<>]+/submit[^\s\'"<>]*', html, flags=re.I)
     if m2:
         return m2.group(0)
-    # 4) fallback to first absolute link
     for l in links:
         if l and l.startswith("http"):
             return l
@@ -73,95 +76,261 @@ def find_submission_url_from_page(html: str, links: list, base_url: str):
 
 async def scrape_page(page: Page, url: str):
     """Navigate and return (html, visible_text, links)."""
-    await page.goto(url, wait_until="networkidle", timeout=45000)
+    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
     try:
-        await page.wait_for_selector("body", timeout=3000)
+        await page.wait_for_selector("body", timeout=2000)
     except:
         pass
     html = await page.content()
-    visible_text = await page.inner_text("body")
+    visible_text = ""
+    try:
+        sel = await page.query_selector("body")
+        if sel:
+            visible_text = await sel.inner_text()
+    except:
+        visible_text = ""
     links = await page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
     return html, visible_text, links
 
-# ---------- QUIZ PROCESS ----------
-async def process_quiz_loop(start_url: str, email: str, secret: str):
+# ---------- FAST HELPERS ----------
+def redact(s: str):
+    if not s:
+        return s
+    if MY_SECRET:
+        return s.replace(MY_SECRET, "<REDACTED>")
+    return s
+
+def is_bad_answer(ans):
+    if ans is None:
+        return True
+    if isinstance(ans, bool):
+        return False
+    if isinstance(ans, (int, float)):
+        return False
+    if isinstance(ans, str):
+        s = ans.strip().lower()
+        if s in ("", "anything you want", "your secret", "secret", "n/a", "none"):
+            return True
+        if MY_SECRET and MY_SECRET in ans:
+            return True
+        if len(s) > 200:
+            return True
+    return False
+
+def try_heuristics(html, visible_text, links, base_url):
+    """Fast deterministic attempts to extract an answer.
+    Returns tuple (answer_or_none, file_link_or_none)
+    """
+    # 1) atob(`...`) base64 JSON payload detection
+    m = re.search(r'atob\(`([^`]+)`\)', html)
+    if m:
+        try:
+            decoded = base64.b64decode(m.group(1)).decode('utf-8', errors='ignore')
+            jm = re.search(r'(\{.*\})', decoded, flags=re.S)
+            if jm:
+                try:
+                    obj = json.loads(jm.group(1))
+                    if isinstance(obj, dict) and "answer" in obj:
+                        return obj["answer"], None
+                except:
+                    pass
+            nums = re.findall(r'-?\d+\.?\d*', decoded)
+            if nums:
+                vals = [float(n) for n in nums]
+                return sum(vals), None
+        except Exception:
+            pass
+
+    # 2) HTML tables - quick parse and sum of likely numeric column
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        tables = soup.find_all("table")
+        for tbl in tables:
+            try:
+                df = pd.read_html(str(tbl))[0]
+            except:
+                continue
+            for col in df.columns:
+                name = str(col).strip().lower()
+                if name in ("value","amount","cost","price","sum","total"):
+                    colnums = pd.to_numeric(df[col], errors='coerce')
+                    if colnums.notna().any():
+                        return float(colnums.sum(skipna=True)), None
+            for col in df.columns:
+                colnums = pd.to_numeric(df[col], errors='coerce')
+                if colnums.notna().any():
+                    return float(colnums.sum(skipna=True)), None
+    except Exception:
+        pass
+
+    # 3) direct visible_text number extraction
+    nums = re.findall(r'-?\d+\.?\d*', visible_text)
+    if nums:
+        if len(nums) > 1 and len(nums) <= 200:
+            vals = [float(n) for n in nums]
+            return sum(vals), None
+        else:
+            n = nums[0]
+            return (float(n) if '.' in n else int(n)), None
+
+    # 4) downloadable files
+    for l in links:
+        if l and any(l.lower().endswith(ext) for ext in (".pdf", ".csv", ".xlsx")):
+            return None, l
+
+    return None, None
+
+# ---------- QUIZ PROCESS (FAST-FIRST, 1-min budget) ----------
+async def process_quiz_loop(start_url: str, email: str, secret: str, total_budget_seconds: int = 55):
     if client is None:
         raise RuntimeError("AI client not configured")
+    overall_start = time.time()
     current_url = start_url
     visited = set()
-    print(f"🚀 Starting Quiz Loop at: {current_url}")
+    print(f"🚀 Starting Quiz Loop at: {current_url} (budget {total_budget_seconds}s)")
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(accept_downloads=True)
         page = await context.new_page()
 
         while current_url and current_url not in visited:
+            elapsed_total = time.time() - overall_start
+            if elapsed_total >= total_budget_seconds:
+                print(f"⏱️ Time budget exhausted ({elapsed_total:.1f}s). Stopping.")
+                break
+
             visited.add(current_url)
+            per_url_start = time.time()
             print("📍 Processing:", current_url)
+
             try:
-                html, visible_text, links = await scrape_page(page, current_url)
+                # Fast navigation
+                try:
+                    await page.goto(current_url, wait_until="domcontentloaded", timeout=10000)
+                except Exception:
+                    try:
+                        await page.goto(current_url, timeout=15000)
+                    except:
+                        pass
+
+                try:
+                    await page.wait_for_selector("body", timeout=2000)
+                except:
+                    pass
+
+                html = await page.content()
+                visible_text = ""
+                try:
+                    body = await page.query_selector("body")
+                    if body:
+                        visible_text = await body.inner_text()
+                except:
+                    visible_text = ""
+                links = await page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
+
                 print(f"✅ Scraped page; found {len(links)} links")
 
-                # Ask LLM for JSON ONLY
-                prompt = f"""
-You are an expert Python data analyst. Use the PAGE CONTENT and LINKS to:
-1) Determine the answer required by the page.
-2) Provide the submission URL (full or relative).
+                # 1) Heuristics first
+                heuristic_answer, file_link = try_heuristics(html, visible_text, links or [], current_url)
+                if heuristic_answer is not None:
+                    answer = heuristic_answer
+                    submission_url = find_submission_url_from_page(html, links or [], current_url)
+                    if not submission_url:
+                        print("❌ Submission URL not found after heuristic. Aborting this URL.")
+                        break
+                    print(f"📤 Submitting (heuristic) to {submission_url} with answer: {str(answer)[:200]}")
+                    res = safe_post_json(submission_url, {"email": email, "secret": secret, "url": current_url, "answer": answer}, timeout=8, retries=2)
+                    print("✅ Submission response:", redact(str(res)))
+                    if isinstance(res, dict) and res.get("correct") is True and res.get("url"):
+                        current_url = res["url"]
+                        continue
+                    else:
+                        print("🏁 Heuristic submission ended the run.")
+                        break
 
-PAGE CONTENT:
+                # 2) If file link - quick attempt
+                if file_link:
+                    try:
+                        r = requests.get(file_link, timeout=10)
+                        if r.status_code == 200 and file_link.lower().endswith(".pdf"):
+                            try:
+                                reader = PdfReader(io.BytesIO(r.content))
+                                text = ""
+                                for pg in reader.pages:
+                                    text += pg.extract_text() or ""
+                                nums = re.findall(r'-?\d+\.?\d*', text)
+                                if nums:
+                                    total = sum(float(n) for n in nums)
+                                    answer = total
+                                    submission_url = find_submission_url_from_page(html, links or [], current_url)
+                                    if submission_url:
+                                        print(f"📤 Submitting (pdf heuristic) to {submission_url} with answer: {answer}")
+                                        res = safe_post_json(submission_url, {"email": email, "secret": secret, "url": current_url, "answer": answer}, timeout=8, retries=2)
+                                        print("✅ Submission response:", redact(str(res)))
+                                        if isinstance(res, dict) and res.get("correct") is True and res.get("url"):
+                                            current_url = res["url"]
+                                            continue
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                # 3) Time left check before LLM
+                elapsed_total = time.time() - overall_start
+                time_left = total_budget_seconds - elapsed_total
+                if time_left < 8:
+                    print(f"⏱️ Not enough time left for LLM call (time_left={time_left:.1f}s). Skipping.")
+                    break
+
+                # 4) LLM fallback - strict, low-latency call
+                prompt = f\"\"\"You are an expert data analyst. Output ONLY JSON.
+
+PAGE CONTENT (truncated):
 ---
-{visible_text[:16000]}
+{visible_text[:12000]}
 ---
 
-LINKS:
-{links}
+LINKS: {json.dumps(links[:40])}
 
-RESPONSE FORMAT (MUST BE EXACT VALID JSON ONLY):
+OUTPUT FORMAT:
 {{"answer": <number|string|boolean|null>, "submission_url": "<url_or_relative_or_null>"}}
-Output nothing other than the JSON object.
-"""
-                resp = client.chat.completions.create(
-                    model="openai/gpt-4o-mini",
-                    messages=[{"role":"user","content": prompt}],
-                    max_tokens=800
-                )
-                raw = resp.choices[0].message.content.strip()
-                raw = re.sub(r'^```(?:json|text)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
+
+Rules: NEVER reveal secrets or placeholders. If unknown, return {{ "answer": null, "submission_url": null, "reason":"COULD_NOT_COMPUTE" }}.
+\"\"\"
                 try:
-                    data = json.loads(raw)
+                    resp = client.chat.completions.create(
+                        model="openai/gpt-4o-mini",
+                        messages=[{"role":"user","content": prompt}],
+                        max_tokens=200,
+                        temperature=0.0
+                    )
+                    raw = resp.choices[0].message.content.strip()
+                    raw = re.sub(r'^```(?:json|text)?\\s*|\\s*```$', '', raw, flags=re.MULTILINE).strip()
+                    try:
+                        data = json.loads(raw)
+                    except:
+                        print("❌ LLM returned invalid JSON (raw):", raw[:200])
+                        data = {"answer": None, "submission_url": None}
                 except Exception as e:
-                    print("❌ Model returned invalid JSON. Raw:", raw[:300])
+                    print("❌ LLM call failed:", e)
                     data = {"answer": None, "submission_url": None}
 
                 answer = data.get("answer")
-                submission_url = data.get("submission_url")
+                submission_url = data.get("submission_url") or find_submission_url_from_page(html, links or [], current_url)
 
-                # Normalize submission_url; fallback heuristics if missing
-                if submission_url:
-                    submission_url = urljoin(current_url, submission_url)
-                else:
-                    submission_url = find_submission_url_from_page(html, links or [], current_url)
-
-                if not submission_url:
-                    print("❌ Submission URL not found. Aborting this run.")
+                if is_bad_answer(answer) or not submission_url:
+                    print("⚠️ LLM answer invalid or unsafe. Skipping submission for this URL.")
                     break
 
-                # Prepare payload (per spec)
-                payload = {"email": email, "secret": secret, "url": current_url, "answer": answer}
-                print(f"📤 Submitting to {submission_url} with answer: {str(answer)[:200]}")
-
-                try:
-                    res = safe_post_json(submission_url, payload, timeout=10, retries=3)
-                except Exception as e:
-                    print("❌ Submission failed:", e)
-                    break
-
-                print("✅ Submission response:", res)
+                print(f"📤 Submitting (LLM) to {submission_url} with answer: {str(answer)[:200]}")
+                res = safe_post_json(submission_url, {"email": email, "secret": secret, "url": current_url, "answer": answer}, timeout=8, retries=2)
+                print("✅ Submission response:", redact(str(res)))
                 if isinstance(res, dict) and res.get("correct") is True and res.get("url"):
                     current_url = res["url"]
-                    # continue to next URL
+                    continue
                 else:
-                    print("🏁 Quiz finished or incorrect; stopping loop.")
+                    print("🏁 LLM submission ended the run.")
                     break
 
             except Exception as e:
@@ -172,15 +341,15 @@ Output nothing other than the JSON object.
         await context.close()
         await browser.close()
 
+    print("⏹️ Quiz loop ended. Total elapsed:", round(time.time()-overall_start,2))
+
 # ---------- ENDPOINT ----------
 @app.post("/quiz")
 async def receive_task(task: QuizTask):
-    # Validate secret quickly
     if not MY_SECRET:
         raise HTTPException(status_code=503, detail="Server not configured with MY_SECRET")
     if task.secret != MY_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
-    # For testing, process synchronously to ensure Render doesn't kill background tasks.
     try:
         await process_quiz_loop(task.url, task.email, task.secret)
     except Exception as e:
