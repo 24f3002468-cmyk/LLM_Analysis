@@ -4,4 +4,4 @@ requests==2.32.5
 pandas==2.3.3
 pypdf==6.3.0
 openai==2.8.1
-# playwright removed — base image already supplies compatible playwright + browsers
+playwright==1.44.0
