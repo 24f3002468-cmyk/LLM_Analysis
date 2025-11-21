@@ -18,7 +18,10 @@ from openai import OpenAI
 # Optional libs used by heuristics
 from bs4 import BeautifulSoup
 import pandas as pd
-from pypdf import PdfReader
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
 
 # ---------- CONFIG ----------
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN") or os.environ.get("OPENAI_API_KEY")
@@ -42,7 +45,6 @@ class QuizTask(BaseModel):
 
 # ---------- UTILITIES ----------
 def safe_post_json(url: str, payload: dict, timeout=10, retries=3):
-    """POST JSON with retries. Returns parsed JSON or raises."""
     if urlparse(url).scheme not in ("http", "https"):
         raise ValueError("Invalid URL scheme")
     for i in range(retries):
@@ -59,7 +61,6 @@ def safe_post_json(url: str, payload: dict, timeout=10, retries=3):
             time.sleep(0.5 * (2 ** i))
 
 def find_submission_url_from_page(html: str, links: list, base_url: str):
-    """Deterministic heuristics to find a submission URL."""
     for l in links:
         if l and any(k in l.lower() for k in ("submit", "answer", "response", "post")):
             return urljoin(base_url, l)
@@ -75,8 +76,13 @@ def find_submission_url_from_page(html: str, links: list, base_url: str):
     return None
 
 async def scrape_page(page: Page, url: str):
-    """Navigate and return (html, visible_text, links)."""
-    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+    except Exception:
+        try:
+            await page.goto(url, timeout=20000)
+        except:
+            pass
     try:
         await page.wait_for_selector("body", timeout=2000)
     except:
@@ -118,10 +124,6 @@ def is_bad_answer(ans):
     return False
 
 def try_heuristics(html, visible_text, links, base_url):
-    """Fast deterministic attempts to extract an answer.
-    Returns tuple (answer_or_none, file_link_or_none)
-    """
-    # 1) atob(`...`) base64 JSON payload detection
     m = re.search(r'atob\(`([^`]+)`\)', html)
     if m:
         try:
@@ -141,7 +143,6 @@ def try_heuristics(html, visible_text, links, base_url):
         except Exception:
             pass
 
-    # 2) HTML tables - quick parse and sum of likely numeric column
     try:
         soup = BeautifulSoup(html, "lxml")
         tables = soup.find_all("table")
@@ -163,7 +164,6 @@ def try_heuristics(html, visible_text, links, base_url):
     except Exception:
         pass
 
-    # 3) direct visible_text number extraction
     nums = re.findall(r'-?\d+\.?\d*', visible_text)
     if nums:
         if len(nums) > 1 and len(nums) <= 200:
@@ -173,7 +173,6 @@ def try_heuristics(html, visible_text, links, base_url):
             n = nums[0]
             return (float(n) if '.' in n else int(n)), None
 
-    # 4) downloadable files
     for l in links:
         if l and any(l.lower().endswith(ext) for ext in (".pdf", ".csv", ".xlsx")):
             return None, l
@@ -201,37 +200,12 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
                 break
 
             visited.add(current_url)
-            per_url_start = time.time()
             print("📍 Processing:", current_url)
 
             try:
-                # Fast navigation
-                try:
-                    await page.goto(current_url, wait_until="domcontentloaded", timeout=10000)
-                except Exception:
-                    try:
-                        await page.goto(current_url, timeout=15000)
-                    except:
-                        pass
-
-                try:
-                    await page.wait_for_selector("body", timeout=2000)
-                except:
-                    pass
-
-                html = await page.content()
-                visible_text = ""
-                try:
-                    body = await page.query_selector("body")
-                    if body:
-                        visible_text = await body.inner_text()
-                except:
-                    visible_text = ""
-                links = await page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
-
+                html, visible_text, links = await scrape_page(page, current_url)
                 print(f"✅ Scraped page; found {len(links)} links")
 
-                # 1) Heuristics first
                 heuristic_answer, file_link = try_heuristics(html, visible_text, links or [], current_url)
                 if heuristic_answer is not None:
                     answer = heuristic_answer
@@ -249,11 +223,10 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
                         print("🏁 Heuristic submission ended the run.")
                         break
 
-                # 2) If file link - quick attempt
                 if file_link:
                     try:
                         r = requests.get(file_link, timeout=10)
-                        if r.status_code == 200 and file_link.lower().endswith(".pdf"):
+                        if r.status_code == 200 and file_link.lower().endswith(".pdf") and PdfReader:
                             try:
                                 reader = PdfReader(io.BytesIO(r.content))
                                 text = ""
@@ -276,28 +249,24 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
                     except Exception:
                         pass
 
-                # 3) Time left check before LLM
                 elapsed_total = time.time() - overall_start
                 time_left = total_budget_seconds - elapsed_total
                 if time_left < 8:
                     print(f"⏱️ Not enough time left for LLM call (time_left={time_left:.1f}s). Skipping.")
                     break
 
-                # 4) LLM fallback - strict, low-latency call
-                prompt = f\"\"\"You are an expert data analyst. Output ONLY JSON.
+                # Build prompt without using f-string that contains braces
+                prompt = (
+                    "You are an expert data analyst. Output ONLY JSON.\n\n"
+                    "PAGE CONTENT (truncated):\n---\n"
+                    + visible_text[:12000]
+                    + "\n---\n\nLINKS: "
+                    + json.dumps(links[:40])
+                    + "\n\nOUTPUT FORMAT:\n"
+                    + '{"answer": <number|string|boolean|null>, "submission_url": "<url_or_relative_or_null>"}'
+                    + "\n\nRules: NEVER reveal secrets or placeholders. If unknown, return { \"answer\": null, \"submission_url\": null, \"reason\":\"COULD_NOT_COMPUTE\" }."
+                )
 
-PAGE CONTENT (truncated):
----
-{visible_text[:12000]}
----
-
-LINKS: {json.dumps(links[:40])}
-
-OUTPUT FORMAT:
-{{"answer": <number|string|boolean|null>, "submission_url": "<url_or_relative_or_null>"}}
-
-Rules: NEVER reveal secrets or placeholders. If unknown, return {{ "answer": null, "submission_url": null, "reason":"COULD_NOT_COMPUTE" }}.
-\"\"\"
                 try:
                     resp = client.chat.completions.create(
                         model="openai/gpt-4o-mini",
@@ -306,7 +275,7 @@ Rules: NEVER reveal secrets or placeholders. If unknown, return {{ "answer": nul
                         temperature=0.0
                     )
                     raw = resp.choices[0].message.content.strip()
-                    raw = re.sub(r'^```(?:json|text)?\\s*|\\s*```$', '', raw, flags=re.MULTILINE).strip()
+                    raw = re.sub(r'^```(?:json|text)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
                     try:
                         data = json.loads(raw)
                     except:
