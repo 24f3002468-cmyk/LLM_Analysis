@@ -77,10 +77,12 @@ def find_submission_url_from_page(html: str, links: list, base_url: str):
 
 async def scrape_page(page: Page, url: str):
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        await page.goto(url, wait_until="networkidle", timeout=8000)
     except Exception:
         try:
-            await page.goto(url, timeout=20000)
+            # fallback to domcontentloaded then small wait to let JS run
+            await page.goto(url, wait_until="domcontentloaded", timeout=8000)
+            await page.wait_for_timeout(500)  # 500ms extra for JS execution
         except:
             pass
     try:
@@ -142,15 +144,17 @@ def try_heuristics(html, visible_text, links, base_url):
             return m3.group(0)
         return None
 
-    # 1) atob(`...`) base64 JSON payload detection
-    m = re.search(r'atob\(`([^`]+)`\)', html)
+    # 1) atob(`...`) or atob("...") or atob('...') base64 JSON payload detection
+    m = re.search(r'atob\((?:`|["\'])([^`"\']+)(?:`|["\'])\)', html)
     if m:
         try:
             decoded = base64.b64decode(m.group(1)).decode('utf-8', errors='ignore')
+            # try JSON inside decoded
             jm = re.search(r'(\{.*\})', decoded, flags=re.S)
             if jm:
                 try:
                     obj = json.loads(jm.group(1))
+                    # if JSON contains an explicit answer field
                     if isinstance(obj, dict) and "answer" in obj:
                         submit_from_json = None
                         for key in ("submission_url", "submit", "submit_url", "url", "action"):
@@ -158,11 +162,14 @@ def try_heuristics(html, visible_text, links, base_url):
                                 submit_from_json = obj[key]
                                 break
                         if submit_from_json:
+                            # normalize later using urljoin
                             return obj["answer"], submit_from_json
+                        # no explicit submit url in json, but maybe present as full url in decoded blob
                         found = find_submit_in_text(decoded)
                         return obj["answer"], found
                 except:
                     pass
+            # fallback: if decoded contains numbers, sum them
             nums = re.findall(r'-?\d+\.?\d*', decoded)
             if nums:
                 vals = [float(n) for n in nums]
@@ -178,11 +185,11 @@ def try_heuristics(html, visible_text, links, base_url):
         for tbl in tables:
             try:
                 df = pd.read_html(str(tbl))[0]
-            except:
+            except Exception:
                 continue
             for col in df.columns:
                 name = str(col).strip().lower()
-                if name in ("value","amount","cost","price","sum","total"):
+                if name in ("value", "amount", "cost", "price", "sum", "total"):
                     colnums = pd.to_numeric(df[col], errors='coerce')
                     if colnums.notna().any():
                         submit_url = find_submit_in_text(html)
@@ -219,7 +226,6 @@ def try_heuristics(html, visible_text, links, base_url):
 
     return None, None
 
-
 # ---------- QUIZ PROCESS (FAST-FIRST, 1-min budget) ----------
 async def process_quiz_loop(start_url: str, email: str, secret: str, total_budget_seconds: int = 55):
     if client is None:
@@ -230,7 +236,8 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
     print(f"🚀 Starting Quiz Loop at: {current_url} (budget {total_budget_seconds}s)")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        # safer browser args for restricted envs
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         context = await browser.new_context(accept_downloads=True)
         page = await context.new_page()
 
@@ -247,10 +254,19 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
                 html, visible_text, links = await scrape_page(page, current_url)
                 print(f"✅ Scraped page; found {len(links)} links")
 
+                # Fast deterministic heuristics first (avoid LLM to save time)
                 heuristic_answer, file_link = try_heuristics(html, visible_text, links or [], current_url)
                 if heuristic_answer is not None:
                     answer = heuristic_answer
+                    # attempt to find submission URL (normalize if relative)
                     submission_url = find_submission_url_from_page(html, links or [], current_url)
+                    # if not found, try extracting from decoded blob by calling try_heuristics again on decoded (it returns raw)
+                    if not submission_url:
+                        # try to extract submit url directly from decoded text (try_heuristics's internal find_submit_in_text already did)
+                        # but find_submission_url_from_page remains primary; fallback to scanning raw html
+                        m2 = re.search(r'https?://[^\s\'"<>]*?(submit|answer|response)[^\s\'"<>]*', html, flags=re.I)
+                        if m2:
+                            submission_url = urljoin(current_url, m2.group(0))
                     if not submission_url:
                         print("❌ Submission URL not found after heuristic. Aborting this URL.")
                         break
@@ -264,6 +280,7 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
                         print("🏁 Heuristic submission ended the run.")
                         break
 
+                # If file link found, attempt PDF parsing quickly
                 if file_link:
                     try:
                         r = requests.get(file_link, timeout=10)
@@ -290,13 +307,14 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
                     except Exception:
                         pass
 
+                # If no deterministic answer, decide if LLM allowed by time left
                 elapsed_total = time.time() - overall_start
                 time_left = total_budget_seconds - elapsed_total
                 if time_left < 8:
                     print(f"⏱️ Not enough time left for LLM call (time_left={time_left:.1f}s). Skipping.")
                     break
 
-                # Build prompt without using f-string that contains braces
+                # Build prompt w/out f-string brace collisions
                 prompt = (
                     "You are an expert data analyst. Output ONLY JSON.\n\n"
                     "PAGE CONTENT (truncated):\n---\n"
@@ -312,14 +330,14 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
                     resp = client.chat.completions.create(
                         model="openai/gpt-4o-mini",
                         messages=[{"role":"user","content": prompt}],
-                        max_tokens=200,
+                        max_tokens=120,
                         temperature=0.0
                     )
                     raw = resp.choices[0].message.content.strip()
                     raw = re.sub(r'^```(?:json|text)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
                     try:
                         data = json.loads(raw)
-                    except:
+                    except Exception:
                         print("❌ LLM returned invalid JSON (raw):", raw[:200])
                         data = {"answer": None, "submission_url": None}
                 except Exception as e:
@@ -358,6 +376,8 @@ async def process_quiz_loop(start_url: str, email: str, secret: str, total_budge
 async def receive_task(task: QuizTask):
     if not MY_SECRET:
         raise HTTPException(status_code=503, detail="Server not configured with MY_SECRET")
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI client not configured (set AIPIPE_TOKEN or OPENAI_API_KEY)")
     if task.secret != MY_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
     try:
