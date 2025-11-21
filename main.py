@@ -28,7 +28,7 @@ except Exception:
 
 # ---------- CONFIG ----------
 MY_SECRET = os.environ.get("MY_SECRET")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get("AIPIPE_TOKEN")
 DEFAULT_BUDGET_SECONDS = int(os.environ.get("DEFAULT_BUDGET_SECONDS", "110"))
 MAX_CONCURRENT_BROWSERS = int(os.environ.get("MAX_CONCURRENT_BROWSERS", "1"))
 
