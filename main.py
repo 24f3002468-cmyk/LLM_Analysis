@@ -131,15 +131,12 @@ def try_heuristics(html, visible_text, links, base_url):
     def find_submit_in_text(text):
         if not text:
             return None
-        # look for obvious /submit endpoints or form action-like urls
         m = re.search(r'https?://[^\s\'"<>]*?/submit[^\s\'"<>]*', text, flags=re.I)
         if m:
             return m.group(0)
-        # look for urls that contain 'submit' or 'answer' keywords
         m2 = re.search(r'https?://[^\s\'"<>]*?(submit|answer|response)[^\s\'"<>]*', text, flags=re.I)
         if m2:
             return m2.group(0)
-        # find any full http(s) url
         m3 = re.search(r'https?://[^\s\'"<>]+', text)
         if m3:
             return m3.group(0)
@@ -150,28 +147,22 @@ def try_heuristics(html, visible_text, links, base_url):
     if m:
         try:
             decoded = base64.b64decode(m.group(1)).decode('utf-8', errors='ignore')
-            # try JSON inside decoded
             jm = re.search(r'(\{.*\})', decoded, flags=re.S)
             if jm:
                 try:
                     obj = json.loads(jm.group(1))
-                    # if JSON contains an explicit answer field
                     if isinstance(obj, dict) and "answer" in obj:
-                        # try common place for submit URL fields
                         submit_from_json = None
                         for key in ("submission_url", "submit", "submit_url", "url", "action"):
                             if key in obj and isinstance(obj[key], str) and obj[key].strip():
                                 submit_from_json = obj[key]
                                 break
                         if submit_from_json:
-                            # normalize relative URLs later; return raw for caller to urljoin
                             return obj["answer"], submit_from_json
-                        # no explicit submit url in json, but maybe present as full url in decoded blob
                         found = find_submit_in_text(decoded)
                         return obj["answer"], found
                 except:
                     pass
-            # fallback: if decoded contains numbers, sum them
             nums = re.findall(r'-?\d+\.?\d*', decoded)
             if nums:
                 vals = [float(n) for n in nums]
@@ -194,7 +185,6 @@ def try_heuristics(html, visible_text, links, base_url):
                 if name in ("value","amount","cost","price","sum","total"):
                     colnums = pd.to_numeric(df[col], errors='coerce')
                     if colnums.notna().any():
-                        # try find submit URL in page HTML too
                         submit_url = find_submit_in_text(html)
                         return float(colnums.sum(skipna=True)), submit_url
             for col in df.columns:
@@ -220,11 +210,9 @@ def try_heuristics(html, visible_text, links, base_url):
     # 4) downloadable files
     for l in links:
         if l and any(l.lower().endswith(ext) for ext in (".pdf", ".csv", ".xlsx")):
-            # if page also embeds submit url in scripts, return that too
             script_submit = find_submit_in_text(html)
             return None, script_submit or l
 
-    # last attempt: try to find any submit-like url in the raw page HTML or visible_text
     final_try = find_submit_in_text(html) or find_submit_in_text(visible_text)
     if final_try:
         return None, final_try
